@@ -7,7 +7,8 @@ To solve this, I developed a bpy-based pipeline to automatically convert MMD mod
 
 The repository is target to Zenless Zone Zero MMD Models Structure.It's for personal, educational, and non-commercial purposes.
 
-[my related work](https://github.com/SUXUING-star/umammd2vrm)
+my related work:https://github.com/SUXUING-star/umammd2vrm & https://github.com/SUXUING-star/wwmmd2vrm
+
 
 ---
 
