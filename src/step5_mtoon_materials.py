@@ -20,7 +20,14 @@ def load_baked_img(texture_dirs, filename, colorspace="sRGB"):
             os.path.join(td, filename),
         ):
             if os.path.exists(fpath):
-                img = bpy.data.images.load(fpath, check_existing=True)
+                # 若 Blender 内存里已有同名旧打包图，先移除再从磁盘加载最新烘焙结果
+                old_img = bpy.data.images.get(os.path.basename(fpath))
+                if old_img is not None:
+                    try:
+                        bpy.data.images.remove(old_img, do_unlink=True)
+                    except Exception:
+                        pass
+                img = bpy.data.images.load(fpath, check_existing=False)
                 try:
                     img.colorspace_settings.name = colorspace
                 except Exception:
@@ -97,7 +104,7 @@ def get_shade_tint_tuple(shading_role):
 
 
 def sample_uv_diagnostics(target_names):
-    """采样重点材质在 UVMap 上的实际像素 RGB/Alpha 与 UV 范围"""
+    """采样重点材质在 UVMap 上的实际不透明像素 RGB 与 Alpha 均值"""
     for obj in bpy.data.objects:
         if obj.type != "MESH" or not obj.data or not obj.data.polygons:
             continue
@@ -141,11 +148,14 @@ def sample_uv_diagnostics(target_names):
                 ix = np.clip((su * (w - 1)).astype(np.int32), 0, w - 1)
                 iy = np.clip((sv * (h - 1)).astype(np.int32), 0, h - 1)
                 px = arr[iy, ix]
-                m_rgb = px[:, :3].mean(axis=0)
-                m_a = px[:, 3].mean()
+                m_a = float(px[:, 3].mean())
+                vis = px[:, 3] >= 0.1
+                vis_rgb = (
+                    px[vis, :3].mean(axis=0) if np.any(vis) else px[:, :3].mean(axis=0)
+                )
                 print(
                     f"   🔬 [UV采样] {s_name} | img={img.name}({w}x{h}) | alpha_mode={gltf.alpha_mode} | "
-                    f"{uv_box} | 采样均值RGB=({m_rgb[0]:.2f},{m_rgb[1]:.2f},{m_rgb[2]:.2f}), A={m_a:.2f}"
+                    f"{uv_box} | 可见RGB=({vis_rgb[0]:.2f},{vis_rgb[1]:.2f},{vis_rgb[2]:.2f}), A均值={m_a:.2f}"
                 )
             else:
                 print(
@@ -173,6 +183,7 @@ def run(texture_dir):
     converted = 0
     total = 0
     uv_diag_targets = set()
+    loaded_cache = {}
 
     for mat in bpy.data.materials:
         if not mat or getattr(mat, "users", 0) == 0:
@@ -198,8 +209,17 @@ def run(texture_dir):
 
         manifest_key = f"{orig_img_name}::{alpha_policy}" if orig_img_name else ""
         info = manifest.get(manifest_key) or manifest.get(orig_img_name, {})
+        is_dead_spa = bool(info.get("is_dead_spa_overlay", False))
+        eff_alpha = 0.0 if is_dead_spa else mat_alpha
 
-        lit_img = load_baked_img(tex_dirs, info.get("lit"), "sRGB")
+        lit_fname = info.get("lit")
+        if lit_fname:
+            if lit_fname not in loaded_cache:
+                loaded_cache[lit_fname] = load_baked_img(tex_dirs, lit_fname, "sRGB")
+            lit_img = loaded_cache[lit_fname]
+        else:
+            lit_img = None
+
         if lit_img is None and orig_img is not None:
             if not orig_img.has_data or orig_img.size[0] <= 0 or orig_img.size[1] <= 0:
                 try:
@@ -212,7 +232,14 @@ def run(texture_dir):
                 print(
                     f"   ⚠️ [空贴图拦截] 材质 [{mat.name}] 的原图 [{orig_img.name}] 无像素数据 (filepath={orig_img.filepath!r})，已回退纯色防止变黑！"
                 )
-        emissive_img = load_baked_img(tex_dirs, info.get("emissive"), "sRGB")
+
+        emi_fname = info.get("emissive")
+        if emi_fname:
+            if emi_fname not in loaded_cache:
+                loaded_cache[emi_fname] = load_baked_img(tex_dirs, emi_fname, "sRGB")
+            emissive_img = loaded_cache[emi_fname]
+        else:
+            emissive_img = None
 
         ext = getattr(mat, "vrm_addon_extension", None)
         if ext is None or not hasattr(ext, "mtoon1"):
@@ -231,20 +258,25 @@ def run(texture_dir):
                 lit_img.pack()
             except Exception:
                 pass
-            gltf.pbr_metallic_roughness.base_color_factor = (1.0, 1.0, 1.0, mat_alpha)
+            gltf.pbr_metallic_roughness.base_color_factor = (1.0, 1.0, 1.0, eff_alpha)
             gltf.pbr_metallic_roughness.base_color_texture.index.source = lit_img
         else:
             ur, ug, ub = resolve_untextured_color(diffuse_rgb, ambient_rgb, role)
-            gltf.pbr_metallic_roughness.base_color_factor = (ur, ug, ub, mat_alpha)
+            gltf.pbr_metallic_roughness.base_color_factor = (ur, ug, ub, eff_alpha)
 
-        if emissive_img:
+        if emissive_img and not is_dead_spa:
             gltf.emissive_texture.index.source = emissive_img
             gltf.emissive_factor = (1.0, 1.0, 1.0)
         else:
             gltf.emissive_factor = (0.0, 0.0, 0.0)
 
         suggested_alpha = info.get("alpha_mode", "OPAQUE")
-        if mat_alpha < 0.99 or role == "fx_overlay" or suggested_alpha == "BLEND":
+        if (
+            is_dead_spa
+            or eff_alpha < 0.99
+            or role == "fx_overlay"
+            or suggested_alpha == "BLEND"
+        ):
             gltf.alpha_mode = "BLEND"
         elif suggested_alpha == "MASK" or (
             role in ("lash_brow", "cutout_cloth") and info.get("has_alpha")

@@ -242,7 +242,15 @@ def find_emissive_counterpart(disk_path, texture_dirs, tex_index=None):
 def is_plus_overlay_material(mat_name: str, img_name: str = "") -> bool:
     m = re.sub(r"\.\d{3}$", "", (mat_name or "").strip().lower())
     i = re.sub(r"\.\d{3}$", "", (img_name or "").strip().lower())
-    return "+" in m or "+" in i or m.startswith("手2")
+    if "+" in m or "+" in i:
+        return True
+    if re.match(r"^(?:手|肌|体|发|髮|衣|鞋|袜|饰|金属)\d+$", m):
+        return True
+    if re.search(r"(?:^|_)(?:s\d*|sp\d*|dp|w|p|t)$", m) or re.search(
+        r"(?:^|_)(?:s\d*|sp\d*|dp)$", os.path.splitext(i)[0]
+    ):
+        return True
+    return False
 
 
 def get_alpha_policy(role: str, mat_name: str = "", img_name: str = "") -> str:
@@ -255,20 +263,57 @@ def get_alpha_policy(role: str, mat_name: str = "", img_name: str = "") -> str:
     return "opaque"
 
 
+def alpha_bleed_rgba(arr, passes=5):
+    """将半透明/不透明边界像素的颜色外扩到透明像素中，防止 LANCZOS 缩放和双线性采样产生纯黑毛边"""
+    alpha = arr[:, :, 3]
+    valid = alpha >= 16.0
+    if np.all(valid) or not np.any(valid):
+        return arr
+
+    out = arr.copy()
+    rgb = out[:, :, :3]
+    h, w = alpha.shape
+    for _ in range(passes):
+        need = ~valid
+        if not np.any(need):
+            break
+        acc = np.zeros_like(rgb)
+        cnt = np.zeros((h, w), dtype=np.float32)
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            y_src = slice(max(0, -dy), h - max(0, dy))
+            x_src = slice(max(0, -dx), w - max(0, dx))
+            y_dst = slice(max(0, dy), h - max(0, -dy))
+            x_dst = slice(max(0, dx), w - max(0, -dx))
+            v_nb = valid[y_src, x_src]
+            acc[y_dst, x_dst][v_nb] += rgb[y_src, x_src][v_nb]
+            cnt[y_dst, x_dst][v_nb] += 1.0
+        fill = need & (cnt > 0.0)
+        if not np.any(fill):
+            break
+        rgb[fill] = acc[fill] / cnt[fill, None]
+        valid = valid | fill
+    return out
+
+
 def maybe_synthesize_black_bg_alpha(arr, role, is_plus=False):
+    """对 fx_overlay 及 +/_w/_s/_sp 叠层：只要不透明区内存在 >5% 的死黑背景（如 体s.png 腰/袖子黑底），将死黑像素抠成透明"""
     if role != "fx_overlay" and not is_plus:
         return arr
     alpha = arr[:, :, 3]
-    if np.any(alpha < 250):
+    opaque_mask = alpha >= 20.0
+    if not np.any(opaque_mask):
         return arr
 
     luma = np.max(arr[:, :, :3], axis=2)
-    black_ratio = float(np.mean(luma < 18.0))
-    threshold = 0.30 if role == "fx_overlay" else 0.55
-    if black_ratio > threshold:
-        new_alpha = np.clip((luma - 12.0) * (255.0 / 243.0), 0.0, 255.0)
+    opaque_luma = luma[opaque_mask]
+    opaque_black_ratio = float(np.mean(opaque_luma < 22.0))
+
+    if opaque_black_ratio > 0.05 and float(np.max(opaque_luma)) > 55.0:
+        # luma <= 15 的纯黑像素 alpha 归零；15~55 平滑过渡；>= 55 的白边/肤色/星星 100% 保持原 alpha
+        luma_alpha = np.clip((luma - 15.0) * (255.0 / 40.0), 0.0, 255.0)
         arr = arr.copy()
-        arr[:, :, 3] = new_alpha
+        dark_zone = luma < 55.0
+        arr[:, :, 3][dark_zone] = np.minimum(alpha[dark_zone], luma_alpha[dark_zone])
     return arr
 
 
@@ -282,16 +327,14 @@ def detect_alpha_mode(rgba_arr, role, mat_or_img_name, is_plus=False):
     non_opaque = alpha < 250
     has_non_opaque = bool(np.any(non_opaque))
 
-    # 对 ZZZ 的 + 叠层材质/贴图（肌+、体+、发+、体2金属+、手2）：
-    # 只要真实存在大面积透明或扣出来的透明像素，就按透明贴图保留 PNG，绝不压成黑底 JPG
+    if transparent_ratio >= 0.45 or (is_plus and transparent_ratio >= 0.05):
+        semi = (alpha > 10) & (alpha < 245)
+        semi_ratio = float(np.sum(semi)) / max(1, int(np.sum(non_opaque)))
+        return True, ("BLEND" if semi_ratio > 0.25 else "MASK")
+
     if is_plus:
-        if transparent_ratio >= 0.05:
-            semi = (alpha > 10) & (alpha < 245)
-            semi_ratio = float(np.sum(semi)) / max(1, int(np.sum(non_opaque)))
-            return True, ("BLEND" if semi_ratio > 0.35 else "MASK")
         return False, "OPAQUE"
 
-    # 普通非叠层的脸/皮肤/眼睛/口腔/头发主体/金属/常规服装 强制 OPAQUE
     if role not in ("lash_brow", "cutout_cloth"):
         return False, "OPAQUE"
 
@@ -306,6 +349,30 @@ def detect_alpha_mode(rgba_arr, role, mat_or_img_name, is_plus=False):
     if semi_ratio > 0.35 and role != "lash_brow":
         return True, "BLEND"
     return True, "MASK"
+
+
+def is_dead_spa_black_overlay(rgba_arr, role, combined_name, is_plus):
+    """检测仅用于 MMD .spa 发光的黑底/全透明叠层（如 肌1_s/体s2.png、裙_菱形s.png），防止往皮肤/裙子上贴黑块"""
+    if role in ("lash_brow", "eye", "mouth_inner", "fx_overlay"):
+        return False
+    low = combined_name.lower()
+    has_spa_hint = is_plus or bool(
+        re.search(r"(?:^|[_\s])(?:s\d*|sp\d*|dp)(?:\.\d{3})?(?:\s|\.|_|$)", low)
+    )
+    if not has_spa_hint:
+        return False
+
+    alpha = rgba_arr[:, :, 3]
+    trans_ratio = float(np.mean(alpha < 20.0))
+    if trans_ratio < 0.50:
+        return False
+
+    opaque_mask = alpha >= 20.0
+    if not np.any(opaque_mask):
+        return True
+
+    opaque_luma = float(np.mean(np.max(rgba_arr[:, :, :3][opaque_mask], axis=1)))
+    return opaque_luma < 38.0
 
 
 def resize_if_needed(pil_img, max_size):
@@ -370,17 +437,30 @@ def run(texture_dir, max_tex_size=1024):
                 )
                 continue
 
-            pil_img = resize_if_needed(pil_img, max_tex_size)
-
-            arr = np.array(pil_img, dtype=np.float32)
-            raw_trans_pct = float(np.mean(arr[:, :, 3] < 20.0)) * 100.0
-            raw_black_pct = float(np.mean(np.max(arr[:, :, :3], axis=2) < 18.0)) * 100.0
+            arr_raw = np.array(pil_img, dtype=np.float32)
+            raw_trans_pct = float(np.mean(arr_raw[:, :, 3] < 20.0)) * 100.0
+            raw_black_pct = (
+                float(np.mean(np.max(arr_raw[:, :, :3], axis=2) < 18.0)) * 100.0
+            )
 
             is_plus = alpha_policy == "plus"
-            arr = maybe_synthesize_black_bg_alpha(arr, role, is_plus=is_plus)
+            arr_raw = maybe_synthesize_black_bg_alpha(arr_raw, role, is_plus=is_plus)
+            after_trans_pct = float(np.mean(arr_raw[:, :, 3] < 20.0)) * 100.0
+            dead_spa = is_dead_spa_black_overlay(arr_raw, role, combined_name, is_plus)
+
+            if np.any(arr_raw[:, :, 3] < 250):
+                arr_raw = alpha_bleed_rgba(arr_raw, passes=5)
+                pil_img = Image.fromarray(
+                    np.clip(arr_raw, 0, 255).astype(np.uint8), mode="RGBA"
+                )
+
+            pil_img = resize_if_needed(pil_img, max_tex_size)
+            arr = np.array(pil_img, dtype=np.float32)
             has_alpha, alpha_mode = detect_alpha_mode(
                 arr, role, combined_name, is_plus=is_plus
             )
+            if has_alpha:
+                arr = alpha_bleed_rgba(arr, passes=3)
 
             short_hash = hashlib.md5(job_key.encode("utf-8")).hexdigest()[:6]
             raw_base = os.path.basename(disk_path) if disk_path else img_obj.name
@@ -426,14 +506,21 @@ def run(texture_dir, max_tex_size=1024):
                 "emissive": emi_fname,
                 "has_alpha": has_alpha,
                 "alpha_mode": alpha_mode,
+                "is_dead_spa_overlay": dead_spa,
             }
             manifest[job_key] = entry
             manifest.setdefault(img_obj.name, entry)
 
             size_kb = os.path.getsize(lit_path) // 1024
+            spa_tag = " [纯黑SPA层->隐藏]" if dead_spa else ""
+            deduct_tag = (
+                f"->扣黑底后透明={after_trans_pct:.0f}%"
+                if after_trans_pct > raw_trans_pct + 1.0
+                else ""
+            )
             print(
-                f"   ✅ [贴图压缩] {raw_base} ({alpha_policy}, 透明={raw_trans_pct:.0f}%, 纯黑={raw_black_pct:.0f}%) "
-                f"-> {lit_fname} ({size_kb} KB, role={role}, alpha={alpha_mode})"
+                f"   ✅ [贴图压缩] {raw_base} ({alpha_policy}, 透明={raw_trans_pct:.0f}%{deduct_tag}, 纯黑={raw_black_pct:.0f}%) "
+                f"-> {lit_fname} ({size_kb} KB, role={role}, alpha={alpha_mode}){spa_tag}"
             )
         except Exception as e:
             print(f"   ⚠️ 贴图 [{job_key}] 处理失败: {e}")

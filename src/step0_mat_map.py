@@ -1,4 +1,3 @@
-# step0_mat_map.py
 import os
 import re
 
@@ -36,7 +35,7 @@ def _is_toon_or_sphere_image(img) -> bool:
 
 
 def extract_material_base_image(mat):
-    """准确提取 mmd_tools 或 Principled BSDF 中的 Base 贴图（避开 ZZZ 的 spa/toon .bmp）"""
+    """准确提取 mmd_tools 或 Principled BSDF 中的 Base 贴图（避开 ZZZ/原神 的 spa/toon .bmp）"""
     if not mat or not mat.use_nodes or not mat.node_tree:
         return None
     nodes = mat.node_tree.nodes
@@ -57,7 +56,6 @@ def extract_material_base_image(mat):
                 and not _is_toon_or_sphere_image(src.image)
             ):
                 return src.image
-        # mmd_shader 明确存在但 Base Tex 未连线，说明该材质为纯色/仅带 spa/toon，不向下误抓
         return None
 
     for node in nodes:
@@ -91,12 +89,12 @@ def _has_token(text: str, pattern: str) -> bool:
 
 
 def classify_material_role(mat_name: str, img_name: str = "") -> str:
-    """结合材质名与贴图名，识别绝区零(ZZZ) MMD 中/英/日/拼音材质角色"""
+    """结合材质名与贴图名，识别绝区零(ZZZ)/原神 MMD 中/英/日/拼音材质角色"""
     m = _clean_blender_suffix(mat_name)
     i = _clean_blender_suffix(img_name)
     s = f"{m} {i}"
 
-    # 1. 眼部高光 / 眼影 / 腮红 / 表情贴片 / 玻璃 / 镜片 / 特效（BLEND + 黑底自动扣透明）
+    # 1. 眼部高光 / 眼影 / 腮红(含照れ) / 表情贴片 / 玻璃 / 镜片 / 特效（BLEND + 黑底自动扣透明）
     if (
         any(
             kw in m
@@ -112,6 +110,8 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
                 "eye_light",
                 "emo",
                 "cheek",
+                "照れ",
+                "tere",
                 "heng",
                 "boli",
                 "glass",
@@ -143,7 +143,16 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
         )
         or any(
             kw in i
-            for kw in ("eyehi", "eyelight", "eyeshadow", "cheek", "sticker", "decal")
+            for kw in (
+                "eyehi",
+                "eyelight",
+                "eyeshadow",
+                "cheek",
+                "照れ",
+                "tere",
+                "sticker",
+                "decal",
+            )
         )
         or _has_token(m, r"hi\d*")
         or (
@@ -155,7 +164,7 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
     ):
         return "fx_overlay"
 
-    # 2. 眉毛 / 睫毛 / 双眼皮线 / 眼线 / 口线（需要 MASK 镂空或干净线条）
+    # 2. 眉毛 / 睫毛 / 双眼皮线 / 眼线 / 口线
     if any(
         kw in m
         for kw in (
@@ -201,7 +210,7 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
     ) or re.match(r"^(she|chi|ya)\d*$", m):
         return "mouth_inner"
 
-    # 4. 眼睛 / 眼白（目光、目影、眼影、眼线已在前两步拦截）
+    # 4. 眼睛 / 眼白
     if any(
         kw in m
         for kw in (
@@ -221,9 +230,9 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
     ) or ("eye" in i and "emo" not in i and "shadow" not in i and "hi" not in i):
         return "eye"
 
-    # 5. 需要透明裁剪的翅膀 / 羽毛 / 蕾丝 / 镂空 / 薄纱 / 头发高光片（发+ 配 发+.png）
-    is_hair_plus_tex = ("发+" in m or "hair+" in m) and (
-        "发+" in i or "hair+" in i or "_hi" in i
+    # 5. 需要透明裁剪的翅膀 / 羽毛 / 蕾丝 / 镂空 / 薄纱 / 头发高光片
+    is_hair_plus_tex = ("发+" in m or "髮+" in m or "hair+" in m) and (
+        "发+" in i or "髮+" in i or "hair+" in i or "_hi" in i or "sp" in i
     )
     if (
         is_hair_plus_tex
@@ -251,14 +260,14 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
     ):
         return "cutout_cloth"
 
-    # 6. 脸部 / 鼻子（同时兼容简体“颜”与繁日“顔”）
+    # 6. 脸部 / 鼻子
     if any(
         kw in m
         for kw in ("face", "kao", "nose", "颜", "顔", "脸", "面部", "鼻", "lian")
     ) or ("face" in i and "emo" not in i and "cheek" not in i):
         return "face"
 
-    # 7. 身体纯皮肤（手/指甲需排除手套/手环/手饰/手甲，体下等交由贴图判断）
+    # 7. 身体纯皮肤
     is_hand_skin = m.startswith("手") and not any(
         ex in m for ex in ("套", "环", "链", "饰", "甲", "护", "2")
     )
@@ -285,7 +294,7 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
     ):
         return "skin"
 
-    # 8. 头发 / 刘海（同时兼容简体“发”与繁日“髪”，排除发饰/发卡/发带等配件）
+    # 8. 头发 / 刘海（排除发饰/发卡/发带等配件）
     is_hair_accessory = any(
         kw in m
         for kw in (
@@ -299,6 +308,8 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
             "发冠",
             "发箍",
             "发结",
+            "髮饰",
+            "髮飾",
         )
     )
     if not is_hair_accessory and any(
@@ -311,6 +322,7 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
             "twintail",
             "ponytail",
             "髪",
+            "髮",
             "头发",
             "前发",
             "后发",

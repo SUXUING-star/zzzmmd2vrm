@@ -332,8 +332,8 @@ def repair_skin_normals(obj):
     )
 
 
-def separate_coplanar_material_overlays(obj, offset=0.0003):
-    """检测同一网格上完全重合的材质面（如 手+手2、发+发+），将后绘制层沿法线微推 0.3mm 彻底消除 Z-fighting 与 EEVEE 光追自阴影变黑"""
+def separate_coplanar_material_overlays(obj, offset=0.00025):
+    """检测同一网格上完全重合的材质面，按叠加层数递增微推(+0.25mm, +0.5mm...)彻底消除 Z-fighting 与 EEVEE 光追自阴影变黑"""
     mesh = obj.data
     if not mesh.polygons or len(mesh.materials) < 2:
         return
@@ -361,6 +361,7 @@ def separate_coplanar_material_overlays(obj, offset=0.0003):
 
     slots = sorted(slot_centers.keys())
     pushed_slots = {}
+    layer_count = defaultdict(int)
     for b_pos, s_b in enumerate(slots):
         c_b = slot_centers[s_b]
         if len(c_b) < 20:
@@ -371,7 +372,9 @@ def separate_coplanar_material_overlays(obj, offset=0.0003):
                 continue
             overlap = len(c_a & c_b)
             if overlap >= 20 and overlap >= 0.5 * min(len(c_a), len(c_b)):
-                pushed_slots[s_b] = s_a
+                root_s = pushed_slots[s_a][0] if s_a in pushed_slots else s_a
+                layer_count[root_s] += 1
+                pushed_slots[s_b] = (root_s, layer_count[root_s])
                 break
 
     if not pushed_slots:
@@ -379,23 +382,29 @@ def separate_coplanar_material_overlays(obj, offset=0.0003):
 
     vert_deltas = {}
     separated_names = []
-    for s_b, s_a in pushed_slots.items():
-        exclusive_verts = slot_verts[s_b] - slot_verts[s_a]
+    for s_b, (s_root, layer_idx) in pushed_slots.items():
+        exclusive_verts = set(slot_verts[s_b]) - set(slot_verts[s_root])
+        for other_b, (other_root, other_layer) in pushed_slots.items():
+            if other_root == s_root and other_layer < layer_idx:
+                exclusive_verts -= slot_verts[other_b]
         if not exclusive_verts:
             continue
         dirs_b = slot_vert_dirs[s_b]
+        step_offset = offset * layer_idx
         cnt = 0
         for v_idx in exclusive_verts:
             if v_idx in vert_deltas:
                 continue
             d = dirs_b.get(v_idx, Vector((0.0, 0.0, 0.0)))
             if d.length_squared > 1e-12:
-                vert_deltas[v_idx] = d.normalized() * offset
+                vert_deltas[v_idx] = d.normalized() * step_offset
                 cnt += 1
         if cnt:
-            mat_a = mesh.materials[s_a].name if mesh.materials[s_a] else str(s_a)
+            mat_a = (
+                mesh.materials[s_root].name if mesh.materials[s_root] else str(s_root)
+            )
             mat_b = mesh.materials[s_b].name if mesh.materials[s_b] else str(s_b)
-            separated_names.append(f"{mat_b}(覆盖{mat_a}, {cnt}点)")
+            separated_names.append(f"{mat_b}(覆盖{mat_a} L{layer_idx}, {cnt}点)")
 
     if not vert_deltas:
         return
@@ -413,9 +422,7 @@ def separate_coplanar_material_overlays(obj, offset=0.0003):
         mesh.use_auto_smooth = True
     mesh.normals_split_custom_set(exact_normals)
     mesh.update()
-    print(
-        f"   🛡️ [{obj.name}] 已分离重合材质层(+{offset * 1000:.1f}mm): {', '.join(separated_names)}"
-    )
+    print(f"   🛡️ [{obj.name}] 已按层级分离重合材质层: {', '.join(separated_names)}")
 
 
 def push_vertices_along_normals(obj, strength=0.0004):
@@ -569,7 +576,7 @@ def run():
             print(f"   ⚠️ 网格 [{obj.name}] 皮肤法线重构跳过: {e}")
 
         try:
-            separate_coplanar_material_overlays(obj, offset=0.0003)
+            separate_coplanar_material_overlays(obj, offset=0.00025)
         except Exception as e:
             print(f"   ⚠️ 网格 [{obj.name}] 重合材质分离跳过: {e}")
 
