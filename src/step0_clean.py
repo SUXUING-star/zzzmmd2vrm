@@ -132,7 +132,13 @@ def compute_proxy_smooth_normals(orig_obj, poly_indices, iterations):
             vert_acc = defaultdict(Vector)
             for p_idx in poly_indices:
                 poly = eval_mesh.polygons[p_idx]
-                area_n = poly.normal * max(poly.area, 1e-8)
+                p_no = poly.normal
+                if (
+                    not all(math.isfinite(x) for x in p_no)
+                    or p_no.length_squared < 1e-12
+                ):
+                    continue
+                area_n = p_no * max(poly.area, 1e-8)
                 for v_idx in poly.vertices:
                     vert_acc[v_idx] += area_n
 
@@ -145,17 +151,35 @@ def compute_proxy_smooth_normals(orig_obj, poly_indices, iterations):
 
             for v_list in co_groups.values():
                 if len(v_list) > 1:
-                    merged = sum((vert_acc[v] for v in v_list), Vector((0.0, 0.0, 0.0)))
+                    orig_norms = {v: vert_acc[v].copy() for v in v_list}
                     for v in v_list:
-                        vert_acc[v] = merged.copy()
+                        base_n = orig_norms[v]
+                        if base_n.length_squared <= 1e-12:
+                            continue
+                        merged = base_n.copy()
+                        for other_v in v_list:
+                            if other_v == v:
+                                continue
+                            on = orig_norms[other_v]
+                            if (
+                                on.length_squared > 1e-12
+                                and base_n.normalized().dot(on.normalized()) > 0.2
+                            ):
+                                merged += on
+                        vert_acc[v] = merged
 
             result = {}
             for v_idx in group_verts:
                 n = vert_acc[v_idx]
-                if n.length_squared > 1e-12:
+                if all(math.isfinite(x) for x in n) and n.length_squared > 1e-12:
                     result[v_idx] = n.normalized()
                 else:
-                    result[v_idx] = Vector(eval_mesh.vertices[v_idx].normal)
+                    orig_n = Vector(orig_mesh.vertices[v_idx].normal)
+                    result[v_idx] = (
+                        orig_n.normalized()
+                        if orig_n.length_squared > 1e-12
+                        else Vector((0.0, 0.0, 1.0))
+                    )
             return result
         finally:
             bpy.data.meshes.remove(eval_mesh)
@@ -228,7 +252,6 @@ def repair_skin_normals(obj):
         mesh.calc_normals_split()
         loop_normals = [tuple(l.normal) for l in mesh.loops]
 
-    # 预先缓存每个材质槽对应的表面类型（结合材质名 + 贴图名）
     slot_kinds = []
     for mat in mesh.materials:
         if not mat:
@@ -255,35 +278,49 @@ def repair_skin_normals(obj):
         return
 
     loops = mesh.loops
+    cos_flip_guard = math.cos(math.radians(80.0))
+
+    def _safe_write_group(poly_list, vn_map, min_dot):
+        skipped_flip = 0
+        for p_idx in poly_list:
+            poly = mesh.polygons[p_idx]
+            p_no = poly.normal
+            if p_no.length_squared < 1e-12:
+                continue
+            cand = []
+            valid = True
+            for l_idx in poly.loop_indices:
+                vn = vn_map.get(loops[l_idx].vertex_index)
+                if (
+                    vn is None
+                    or not all(math.isfinite(x) for x in vn)
+                    or vn.length_squared < 1e-12
+                    or p_no.dot(vn) < min_dot
+                ):
+                    valid = False
+                    break
+                cand.append((l_idx, tuple(vn.normalized())))
+            if valid:
+                poly.use_smooth = True
+                for l_idx, n_tup in cand:
+                    loop_normals[l_idx] = n_tup
+            else:
+                skipped_flip += 1
+        return skipped_flip
 
     if groups["face_skin"]:
         face_vn = compute_proxy_smooth_normals(obj, groups["face_skin"], iterations=16)
         face_vn = apply_face_ellipsoid_blend(obj, face_vn, blend=0.65)
-        for p_idx in groups["face_skin"]:
-            poly = mesh.polygons[p_idx]
-            poly.use_smooth = True
-            for l_idx in poly.loop_indices:
-                loop_normals[l_idx] = tuple(face_vn[loops[l_idx].vertex_index])
+        _safe_write_group(groups["face_skin"], face_vn, cos_flip_guard)
 
     if groups["body_skin"]:
-        skin_vn = compute_proxy_smooth_normals(obj, groups["body_skin"], iterations=12)
-        for p_idx in groups["body_skin"]:
-            poly = mesh.polygons[p_idx]
-            poly.use_smooth = True
-            for l_idx in poly.loop_indices:
-                loop_normals[l_idx] = tuple(skin_vn[loops[l_idx].vertex_index])
+        skin_vn = compute_proxy_smooth_normals(obj, groups["body_skin"], iterations=8)
+        _safe_write_group(groups["body_skin"], skin_vn, cos_flip_guard)
 
     if groups["body_mixed"]:
         mixed_vn = compute_proxy_smooth_normals(obj, groups["body_mixed"], iterations=5)
         cos_crease = math.cos(math.radians(55.0))
-        for p_idx in groups["body_mixed"]:
-            poly = mesh.polygons[p_idx]
-            p_no = poly.normal
-            for l_idx in poly.loop_indices:
-                vn = mixed_vn[loops[l_idx].vertex_index]
-                if p_no.dot(vn) >= cos_crease:
-                    poly.use_smooth = True
-                    loop_normals[l_idx] = tuple(vn)
+        _safe_write_group(groups["body_mixed"], mixed_vn, cos_crease)
 
     if hasattr(mesh, "use_auto_smooth"):
         mesh.use_auto_smooth = True
@@ -292,6 +329,92 @@ def repair_skin_normals(obj):
     print(
         f"   ✨ [{obj.name}] 法线重构完成: "
         f"脸部={len(groups['face_skin'])}面, 纯皮肤={len(groups['body_skin'])}面, 身体混合={len(groups['body_mixed'])}面"
+    )
+
+
+def separate_coplanar_material_overlays(obj, offset=0.0003):
+    """检测同一网格上完全重合的材质面（如 手+手2、发+发+），将后绘制层沿法线微推 0.3mm 彻底消除 Z-fighting 与 EEVEE 光追自阴影变黑"""
+    mesh = obj.data
+    if not mesh.polygons or len(mesh.materials) < 2:
+        return
+
+    if hasattr(mesh, "corner_normals"):
+        exact_normals = [tuple(cn.vector) for cn in mesh.corner_normals]
+    else:
+        mesh.calc_normals_split()
+        exact_normals = [tuple(l.normal) for l in mesh.loops]
+
+    slot_centers = defaultdict(set)
+    slot_verts = defaultdict(set)
+    slot_vert_dirs = defaultdict(lambda: defaultdict(Vector))
+
+    for poly in mesh.polygons:
+        s_idx = poly.material_index
+        c = poly.center
+        slot_centers[s_idx].add((round(c.x, 4), round(c.y, 4), round(c.z, 4)))
+        p_no = poly.normal
+        valid_no = all(math.isfinite(x) for x in p_no) and p_no.length_squared > 1e-12
+        for v_idx in poly.vertices:
+            slot_verts[s_idx].add(v_idx)
+            if valid_no:
+                slot_vert_dirs[s_idx][v_idx] += p_no
+
+    slots = sorted(slot_centers.keys())
+    pushed_slots = {}
+    for b_pos, s_b in enumerate(slots):
+        c_b = slot_centers[s_b]
+        if len(c_b) < 20:
+            continue
+        for s_a in slots[:b_pos]:
+            c_a = slot_centers[s_a]
+            if len(c_a) < 20:
+                continue
+            overlap = len(c_a & c_b)
+            if overlap >= 20 and overlap >= 0.5 * min(len(c_a), len(c_b)):
+                pushed_slots[s_b] = s_a
+                break
+
+    if not pushed_slots:
+        return
+
+    vert_deltas = {}
+    separated_names = []
+    for s_b, s_a in pushed_slots.items():
+        exclusive_verts = slot_verts[s_b] - slot_verts[s_a]
+        if not exclusive_verts:
+            continue
+        dirs_b = slot_vert_dirs[s_b]
+        cnt = 0
+        for v_idx in exclusive_verts:
+            if v_idx in vert_deltas:
+                continue
+            d = dirs_b.get(v_idx, Vector((0.0, 0.0, 0.0)))
+            if d.length_squared > 1e-12:
+                vert_deltas[v_idx] = d.normalized() * offset
+                cnt += 1
+        if cnt:
+            mat_a = mesh.materials[s_a].name if mesh.materials[s_a] else str(s_a)
+            mat_b = mesh.materials[s_b].name if mesh.materials[s_b] else str(s_b)
+            separated_names.append(f"{mat_b}(覆盖{mat_a}, {cnt}点)")
+
+    if not vert_deltas:
+        return
+
+    for v_idx, delta in vert_deltas.items():
+        mesh.vertices[v_idx].co += delta
+
+    if mesh.shape_keys and len(mesh.shape_keys.key_blocks) > 0:
+        for kb in mesh.shape_keys.key_blocks:
+            for v_idx, delta in vert_deltas.items():
+                kb.data[v_idx].co += delta
+
+    mesh.update()
+    if hasattr(mesh, "use_auto_smooth"):
+        mesh.use_auto_smooth = True
+    mesh.normals_split_custom_set(exact_normals)
+    mesh.update()
+    print(
+        f"   🛡️ [{obj.name}] 已分离重合材质层(+{offset * 1000:.1f}mm): {', '.join(separated_names)}"
     )
 
 
@@ -315,9 +438,9 @@ def push_vertices_along_normals(obj, strength=0.0004):
             vert_dirs[i] = Vector(mesh.vertices[i].normal)
 
     if mesh.shape_keys and len(mesh.shape_keys.key_blocks) > 0:
-        basis = mesh.shape_keys.key_blocks[0]
-        for i, kb_vert in enumerate(basis.data):
-            kb_vert.co += vert_dirs[i] * strength
+        for kb in mesh.shape_keys.key_blocks:
+            for i, kb_vert in enumerate(kb.data):
+                kb_vert.co += vert_dirs[i] * strength
         mesh.update()
     else:
         for i, vert in enumerate(mesh.vertices):
@@ -381,7 +504,6 @@ def clear_mmd_armature_constraints():
 def run():
     print(">>> [步骤 0] 无损法线保护 + 皮肤代理法线重构 + 清理 mmd_tools 刚体/关节...")
 
-    # 在删除 MMD 刚体/关节前仅拍取轻量化物理快照，避免步骤 1 改名时触发 VRM 回调卡顿
     snapshot_mmd_physics_to_armature()
     clear_mmd_armature_constraints()
 
@@ -445,6 +567,11 @@ def run():
             repair_skin_normals(obj)
         except Exception as e:
             print(f"   ⚠️ 网格 [{obj.name}] 皮肤法线重构跳过: {e}")
+
+        try:
+            separate_coplanar_material_overlays(obj, offset=0.0003)
+        except Exception as e:
+            print(f"   ⚠️ 网格 [{obj.name}] 重合材质分离跳过: {e}")
 
         obj_name_lower = obj.name.lower()
         is_clothing = any(

@@ -57,7 +57,6 @@ def normalize_texture_dirs(texture_dir_or_dirs):
         )
         candidates.append(p)
 
-    # 自动向周围探测（防止只传了单一目录时漏掉另一个 tex / Texture2D 等目录）
     probe_roots = []
     if blend_dir and os.path.isdir(blend_dir):
         probe_roots.append(blend_dir)
@@ -83,7 +82,6 @@ def normalize_texture_dirs(texture_dir_or_dirs):
     if blend_dir and os.path.isdir(blend_dir):
         candidates.append(blend_dir)
 
-    # 补充 Blender 中各 Image 节点实际指向的目录
     for img in bpy.data.images:
         fp = (img.filepath or "").replace("\\", "/")
         if not fp:
@@ -127,7 +125,6 @@ def build_texture_index(texture_dirs):
                 by_filename.setdefault(fname.lower(), full_p)
                 stem = os.path.splitext(fname)[0].lower()
                 by_stem.setdefault(stem, full_p)
-            # 若是根目录本身，仅扫当前层，避免把子目录重复再扫一遍
             if is_root_blend:
                 break
 
@@ -242,44 +239,66 @@ def find_emissive_counterpart(disk_path, texture_dirs, tex_index=None):
     return None
 
 
-def get_alpha_policy(role: str) -> str:
+def is_plus_overlay_material(mat_name: str, img_name: str = "") -> bool:
+    m = re.sub(r"\.\d{3}$", "", (mat_name or "").strip().lower())
+    i = re.sub(r"\.\d{3}$", "", (img_name or "").strip().lower())
+    return "+" in m or "+" in i or m.startswith("手2")
+
+
+def get_alpha_policy(role: str, mat_name: str = "", img_name: str = "") -> str:
     if role == "fx_overlay":
         return "fx"
     if role in ("lash_brow", "cutout_cloth"):
         return "alpha"
+    if is_plus_overlay_material(mat_name, img_name):
+        return "plus"
     return "opaque"
 
 
-def maybe_synthesize_black_bg_alpha(arr, role):
-    if role != "fx_overlay":
+def maybe_synthesize_black_bg_alpha(arr, role, is_plus=False):
+    if role != "fx_overlay" and not is_plus:
         return arr
     alpha = arr[:, :, 3]
     if np.any(alpha < 250):
         return arr
 
     luma = np.max(arr[:, :, :3], axis=2)
-    if float(np.mean(luma < 25.0)) > 0.30:
+    black_ratio = float(np.mean(luma < 18.0))
+    threshold = 0.30 if role == "fx_overlay" else 0.55
+    if black_ratio > threshold:
         new_alpha = np.clip((luma - 12.0) * (255.0 / 243.0), 0.0, 255.0)
         arr = arr.copy()
         arr[:, :, 3] = new_alpha
     return arr
 
 
-def detect_alpha_mode(rgba_arr, role, mat_or_img_name):
+def detect_alpha_mode(rgba_arr, role, mat_or_img_name, is_plus=False):
     name_low = mat_or_img_name.lower()
     if role == "fx_overlay":
         return True, "BLEND"
 
-    # 脸/皮肤/眼睛/口腔/头发主体/金属/常规服装 强制 OPAQUE，防止 Unity ZZZ 通道掩码把模型抠穿
+    alpha = rgba_arr[:, :, 3]
+    transparent_ratio = float(np.mean(alpha < 20.0))
+    non_opaque = alpha < 250
+    has_non_opaque = bool(np.any(non_opaque))
+
+    # 对 ZZZ 的 + 叠层材质/贴图（肌+、体+、发+、体2金属+、手2）：
+    # 只要真实存在大面积透明或扣出来的透明像素，就按透明贴图保留 PNG，绝不压成黑底 JPG
+    if is_plus:
+        if transparent_ratio >= 0.05:
+            semi = (alpha > 10) & (alpha < 245)
+            semi_ratio = float(np.sum(semi)) / max(1, int(np.sum(non_opaque)))
+            return True, ("BLEND" if semi_ratio > 0.35 else "MASK")
+        return False, "OPAQUE"
+
+    # 普通非叠层的脸/皮肤/眼睛/口腔/头发主体/金属/常规服装 强制 OPAQUE
     if role not in ("lash_brow", "cutout_cloth"):
         return False, "OPAQUE"
 
     if "noalpha" in name_low and "alpha" not in name_low.replace("noalpha", ""):
         return False, "OPAQUE"
 
-    alpha = rgba_arr[:, :, 3]
-    non_opaque = alpha < 250
-    if not np.any(non_opaque):
+    if not has_non_opaque:
         return False, "OPAQUE"
 
     semi = (alpha > 10) & (alpha < 245)
@@ -322,7 +341,7 @@ def run(texture_dir, max_tex_size=1024):
         if not base_img:
             continue
         role = classify_material_role(mat.name, base_img.name)
-        alpha_policy = get_alpha_policy(role)
+        alpha_policy = get_alpha_policy(role, mat.name, base_img.name)
         job_key = f"{base_img.name}::{alpha_policy}"
         if job_key not in image_jobs:
             image_jobs[job_key] = (
@@ -337,15 +356,31 @@ def run(texture_dir, max_tex_size=1024):
     for job_key, (img_obj, role, alpha_policy, combined_name) in image_jobs.items():
         disk_path = resolve_disk_path(img_obj, tex_dirs, tex_index=tex_index)
         try:
+            if (
+                not disk_path or not os.path.exists(disk_path)
+            ) and not img_obj.has_data:
+                try:
+                    img_obj.reload()
+                except Exception:
+                    pass
             pil_img = image_to_pil_rgba(img_obj, disk_path)
             if pil_img is None:
+                print(
+                    f"   ⚠️ [贴图缺失] 无法加载 {job_key} (filepath={img_obj.filepath!r}, mat_hint={combined_name})"
+                )
                 continue
 
             pil_img = resize_if_needed(pil_img, max_tex_size)
 
             arr = np.array(pil_img, dtype=np.float32)
-            arr = maybe_synthesize_black_bg_alpha(arr, role)
-            has_alpha, alpha_mode = detect_alpha_mode(arr, role, combined_name)
+            raw_trans_pct = float(np.mean(arr[:, :, 3] < 20.0)) * 100.0
+            raw_black_pct = float(np.mean(np.max(arr[:, :, :3], axis=2) < 18.0)) * 100.0
+
+            is_plus = alpha_policy == "plus"
+            arr = maybe_synthesize_black_bg_alpha(arr, role, is_plus=is_plus)
+            has_alpha, alpha_mode = detect_alpha_mode(
+                arr, role, combined_name, is_plus=is_plus
+            )
 
             short_hash = hashlib.md5(job_key.encode("utf-8")).hexdigest()[:6]
             raw_base = os.path.basename(disk_path) if disk_path else img_obj.name
@@ -397,7 +432,8 @@ def run(texture_dir, max_tex_size=1024):
 
             size_kb = os.path.getsize(lit_path) // 1024
             print(
-                f"   ✅ [贴图压缩] {raw_base} ({alpha_policy}) -> {lit_fname} ({size_kb} KB, role={role}, alpha={alpha_mode})"
+                f"   ✅ [贴图压缩] {raw_base} ({alpha_policy}, 透明={raw_trans_pct:.0f}%, 纯黑={raw_black_pct:.0f}%) "
+                f"-> {lit_fname} ({size_kb} KB, role={role}, alpha={alpha_mode})"
             )
         except Exception as e:
             print(f"   ⚠️ 贴图 [{job_key}] 处理失败: {e}")

@@ -2,6 +2,7 @@ import json
 import os
 
 import bpy
+import numpy as np
 
 from step0_mat_map import classify_material_role, extract_material_base_image
 from step4_bake_texture import get_alpha_policy, normalize_texture_dirs
@@ -36,7 +37,7 @@ def extract_mmd_or_bsdf_props(mat):
     diffuse = (1.0, 1.0, 1.0)
     ambient = (0.5, 0.5, 0.5)
     alpha = 1.0
-    double_sided = True
+    double_sided = False
 
     mmd_mat = getattr(mat, "mmd_material", None)
     if mmd_mat:
@@ -67,16 +68,13 @@ def extract_mmd_or_bsdf_props(mat):
 
 
 def resolve_untextured_color(diffuse_rgb, ambient_rgb, role):
-    """无贴图材质（如目白/齿/目光/睫/口线）：补偿 MMD 暗 diffuse+ambient，同时保住纯黑线条"""
     dr, dg, db = diffuse_rgb
     ar, ag, ab = ambient_rgb
     if max(dr, dg, db) <= 0.02:
-        # 睫毛/口线/二重等若 diffuse 与 ambient 都是黑的，保持纯黑不要变成白色
         if max(ar, ag, ab) <= 0.05 or role in ("lash_brow",):
             return (dr, dg, db)
         return (min(1.0, ar), min(1.0, ag), min(1.0, ab))
 
-    # MMD 无贴图亮部近似为 diffuse + ambient 补偿，防止目白/齿发灰
     return (
         min(1.0, dr + ar * 0.5),
         min(1.0, dg + ag * 0.5),
@@ -85,7 +83,6 @@ def resolve_untextured_color(diffuse_rgb, ambient_rgb, role):
 
 
 def get_shade_tint_tuple(shading_role):
-    """参考 umammd 暖肉色皮肤阴影与通透微紫灰暗部，避免发灰发脏"""
     if shading_role in ("face", "skin"):
         return (0.92, 0.76, 0.74)
     if shading_role in ("eye", "fx_overlay"):
@@ -97,6 +94,63 @@ def get_shade_tint_tuple(shading_role):
     if shading_role == "mouth_inner":
         return (0.86, 0.75, 0.75)
     return (0.80, 0.78, 0.85)
+
+
+def sample_uv_diagnostics(target_names):
+    """采样重点材质在 UVMap 上的实际像素 RGB/Alpha 与 UV 范围"""
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or not obj.data or not obj.data.polygons:
+            continue
+        mesh = obj.data
+        if not mesh.uv_layers:
+            continue
+        uv_data = mesh.uv_layers.active.data
+        slot_by_name = {
+            m.name: idx
+            for idx, m in enumerate(mesh.materials)
+            if m and m.name in target_names
+        }
+        if not slot_by_name:
+            continue
+
+        img_cache = {}
+        for s_name, s_idx in slot_by_name.items():
+            mat = mesh.materials[s_idx]
+            gltf = mat.vrm_addon_extension.mtoon1
+            img = gltf.pbr_metallic_roughness.base_color_texture.index.source
+            us, vs = [], []
+            for poly in mesh.polygons:
+                if poly.material_index != s_idx:
+                    continue
+                for l_idx in poly.loop_indices:
+                    u, v = uv_data[l_idx].uv
+                    us.append(u)
+                    vs.append(v)
+            if not us:
+                continue
+            uv_box = f"u=[{min(us):.2f},{max(us):.2f}], v=[{min(vs):.2f},{max(vs):.2f}]"
+            if img and img.has_data and img.size[0] > 0 and img.size[1] > 0:
+                if img.name not in img_cache:
+                    w, h = img.size[0], img.size[1]
+                    arr = np.array(img.pixels[:], dtype=np.float32).reshape((h, w, 4))
+                    img_cache[img.name] = (w, h, arr)
+                w, h, arr = img_cache[img.name]
+                step = max(1, len(us) // 256)
+                su = np.mod(np.array(us[::step]), 1.0)
+                sv = np.mod(np.array(vs[::step]), 1.0)
+                ix = np.clip((su * (w - 1)).astype(np.int32), 0, w - 1)
+                iy = np.clip((sv * (h - 1)).astype(np.int32), 0, h - 1)
+                px = arr[iy, ix]
+                m_rgb = px[:, :3].mean(axis=0)
+                m_a = px[:, 3].mean()
+                print(
+                    f"   🔬 [UV采样] {s_name} | img={img.name}({w}x{h}) | alpha_mode={gltf.alpha_mode} | "
+                    f"{uv_box} | 采样均值RGB=({m_rgb[0]:.2f},{m_rgb[1]:.2f},{m_rgb[2]:.2f}), A={m_a:.2f}"
+                )
+            else:
+                print(
+                    f"   🔬 [UV采样] {s_name} | 无贴图 | alpha_mode={gltf.alpha_mode} | {uv_box}"
+                )
 
 
 def run(texture_dir):
@@ -118,6 +172,7 @@ def run(texture_dir):
 
     converted = 0
     total = 0
+    uv_diag_targets = set()
 
     for mat in bpy.data.materials:
         if not mat or getattr(mat, "users", 0) == 0:
@@ -132,7 +187,7 @@ def run(texture_dir):
         )
         orig_img_name = orig_img.name if orig_img else ""
         role = classify_material_role(mat.name, orig_img_name)
-        alpha_policy = get_alpha_policy(role)
+        alpha_policy = get_alpha_policy(role, mat.name, orig_img_name)
 
         if role in ("face", "skin"):
             shading_role = "face"
@@ -143,7 +198,20 @@ def run(texture_dir):
 
         manifest_key = f"{orig_img_name}::{alpha_policy}" if orig_img_name else ""
         info = manifest.get(manifest_key) or manifest.get(orig_img_name, {})
-        lit_img = load_baked_img(tex_dirs, info.get("lit"), "sRGB") or orig_img
+
+        lit_img = load_baked_img(tex_dirs, info.get("lit"), "sRGB")
+        if lit_img is None and orig_img is not None:
+            if not orig_img.has_data or orig_img.size[0] <= 0 or orig_img.size[1] <= 0:
+                try:
+                    orig_img.reload()
+                except Exception:
+                    pass
+            if orig_img.has_data and orig_img.size[0] > 0 and orig_img.size[1] > 0:
+                lit_img = orig_img
+            else:
+                print(
+                    f"   ⚠️ [空贴图拦截] 材质 [{mat.name}] 的原图 [{orig_img.name}] 无像素数据 (filepath={orig_img.filepath!r})，已回退纯色防止变黑！"
+                )
         emissive_img = load_baked_img(tex_dirs, info.get("emissive"), "sRGB")
 
         ext = getattr(mat, "vrm_addon_extension", None)
@@ -155,13 +223,9 @@ def run(texture_dir):
         gltf = ext.mtoon1
         gltf.enabled = True
         gltf.double_sided = (
-            True
-            if role in ("lash_brow", "cutout_cloth", "fx_overlay", "hair")
-            else is_double_sided
+            True if role in ("lash_brow", "fx_overlay") else is_double_sided
         )
 
-        # 核心修复（同 umammd）：只要存在贴图，base_color_factor 必须保持纯白 (1, 1, 1, alpha)，
-        # 避免 MMD 默认偏暗/偏灰的 diffuse_color 直接把贴图乘黑！
         if lit_img:
             try:
                 lit_img.pack()
@@ -182,19 +246,22 @@ def run(texture_dir):
         suggested_alpha = info.get("alpha_mode", "OPAQUE")
         if mat_alpha < 0.99 or role == "fx_overlay" or suggested_alpha == "BLEND":
             gltf.alpha_mode = "BLEND"
-        elif role in ("lash_brow", "cutout_cloth") and (
-            suggested_alpha == "MASK" or info.get("has_alpha")
+        elif suggested_alpha == "MASK" or (
+            role in ("lash_brow", "cutout_cloth") and info.get("has_alpha")
         ):
             gltf.alpha_mode = "MASK"
             gltf.alpha_cutoff = 0.5
         else:
             gltf.alpha_mode = "OPAQUE"
 
+        if hasattr(mat, "surface_render_method") and gltf.alpha_mode != "BLEND":
+            if mat.surface_render_method == "BLENDED":
+                mat.surface_render_method = "DITHERED"
+
         mtoon = gltf.extensions.vrmc_materials_mtoon
         mtoon.transparent_with_z_write = False
         mtoon.render_queue_offset_number = 1 if gltf.alpha_mode == "BLEND" else 0
 
-        # 暗部颜色同样不再乘偏暗的 diffuse_rgb，直接套用通透阴影 tint
         tint = get_shade_tint_tuple(shading_role)
         if lit_img:
             mtoon.shade_multiply_texture.index.source = lit_img
@@ -203,7 +270,6 @@ def run(texture_dir):
             ur, ug, ub = resolve_untextured_color(diffuse_rgb, ambient_rgb, role)
             mtoon.shade_color_factor = (ur * tint[0], ug * tint[1], ub * tint[2])
 
-        # 沿用 umammd 明暗交界与 GI 均等化调色参数（整体提亮通透）
         if shading_role in ("face", "skin"):
             mtoon.shading_shift_factor = 0.12
             mtoon.shading_toony_factor = 0.22
@@ -228,7 +294,21 @@ def run(texture_dir):
         mtoon.outline_width_mode = "none"
         if mat.node_tree:
             mat.node_tree.update_tag()
+
+        if any(k in mat.name for k in ("手", "肌", "衣金属+", "鞋+")):
+            uv_diag_targets.add(mat.name)
+
         converted += 1
+
+    if uv_diag_targets:
+        sample_uv_diagnostics(uv_diag_targets)
+
+    for img in list(bpy.data.images):
+        if not img.has_data or img.size[0] <= 0 or img.size[1] <= 0:
+            try:
+                bpy.data.images.remove(img, do_unlink=True)
+            except Exception:
+                pass
 
     try:
         bpy.ops.outliner.orphans_purge(

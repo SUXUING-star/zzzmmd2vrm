@@ -354,7 +354,6 @@ def classify_surface_for_normals(
     """用于步骤 0 皮肤法线光滑分类"""
     role = classify_material_role(mat_name, img_name)
     m = _clean_blender_suffix(mat_name)
-    i = _clean_blender_suffix(img_name)
 
     if role == "face":
         if "nose" in m or "鼻" in m or "zhou" in m:
@@ -362,11 +361,15 @@ def classify_surface_for_normals(
         return "face_skin"
 
     if role == "skin":
-        # 指甲保持锐利边缘；“手”仅在使用纯皮肤贴图肌时强平滑，使用混合体贴图时降级为 body_mixed
-        if "指甲" in m or "nail" in m:
+        # 手部/手指/指甲几何体极细，严禁进 SMOOTH 代理平滑，否则手指会被压瘪导致法线翻转变黑
+        if (
+            m.startswith("手")
+            or "hand" in m
+            or "finger" in m
+            or "指甲" in m
+            or "nail" in m
+        ):
             return "other"
-        if m.startswith("手") and not any(k in i for k in ("肌", "skin", "hada")):
-            return "body_mixed"
         return "body_skin"
 
     if role in (
@@ -380,7 +383,6 @@ def classify_surface_for_normals(
     ):
         return "other"
 
-    # 绝区零身体混合材质（体 / 体下 / 体上 / body）做柔和曲面平滑，排除纯饰品/鞋袜/披风
     if any(
         kw in m
         for kw in (
@@ -403,7 +405,7 @@ def classify_surface_for_normals(
     ):
         return "other"
 
-    s = f"{m} {i}"
+    s = f"{m} {_clean_blender_suffix(img_name)}"
     if (
         m in ("体", "体上", "体下", "体2", "身体")
         or any(
