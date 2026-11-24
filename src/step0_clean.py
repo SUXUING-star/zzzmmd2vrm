@@ -62,133 +62,235 @@ def get_head_bone_local_z(obj):
     return None
 
 
-def compute_proxy_smooth_normals(orig_obj, poly_indices, iterations):
+def compute_welded_smooth_normals(
+    orig_obj, poly_indices, smooth_passes=3, crease_deg=70.0
+):
+    """在内存 bmesh 中按同材质焊接改模未合并裂缝，做纯法线空间平滑（不移动顶点，避免嘴角/背部挤压脏影）"""
     orig_mesh = orig_obj.data
-    poly_set = set(poly_indices)
+    target_slots = {orig_mesh.polygons[p].material_index for p in poly_indices}
+    cos_limit = math.cos(math.radians(crease_deg))
+
+    group_verts = set()
+    vert_slot = {}
+    orig_vert_acc = defaultdict(Vector)
+    for p_idx in poly_indices:
+        poly = orig_mesh.polygons[p_idx]
+        p_no = poly.normal
+        valid_no = all(math.isfinite(x) for x in p_no) and p_no.length_squared > 1e-12
+        area_n = p_no * max(poly.area, 1e-8) if valid_no else Vector((0.0, 0.0, 0.0))
+        for v_idx in poly.vertices:
+            group_verts.add(v_idx)
+            vert_slot.setdefault(v_idx, poly.material_index)
+            orig_vert_acc[v_idx] += area_n
 
     bm = bmesh.new()
     bm.from_mesh(orig_mesh)
+    bm.verts.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
 
-    group_verts = set()
-    pinned_verts = set()
-    for f_idx in poly_indices:
-        for v in bm.faces[f_idx].verts:
-            group_verts.add(v.index)
-
-    for edge in bm.edges:
-        in_group_faces = [f for f in edge.link_faces if f.index in poly_set]
-        if not in_group_faces:
-            continue
-        if len(edge.link_faces) == 1 or len(in_group_faces) < len(edge.link_faces):
-            pinned_verts.add(edge.verts[0].index)
-            pinned_verts.add(edge.verts[1].index)
-    bm.free()
-
-    proxy_mesh = orig_mesh.copy()
-    proxy_obj = bpy.data.objects.new("__tmp_norm_proxy__", proxy_mesh)
-    bpy.context.scene.collection.objects.link(proxy_obj)
-
+    welded_cnt = 0
     try:
-        if proxy_obj.data.shape_keys:
-            for kb in list(proxy_obj.data.shape_keys.key_blocks)[::-1]:
-                proxy_obj.shape_key_remove(kb)
+        bm_vert_slots = defaultdict(set)
+        bm_vert_acc = defaultdict(Vector)
+        for f in bm.faces:
+            is_tgt = f.material_index in target_slots
+            f_no = f.normal
+            valid_no = (
+                all(math.isfinite(x) for x in f_no) and f_no.length_squared > 1e-12
+            )
+            area_n = (
+                f_no * max(f.calc_area(), 1e-8) if valid_no else Vector((0.0, 0.0, 0.0))
+            )
+            for v in f.verts:
+                bm_vert_slots[v.index].add(f.material_index if is_tgt else -1)
+                if is_tgt:
+                    bm_vert_acc[v.index] += area_n
 
-        bpy.context.view_layer.objects.active = proxy_obj
-        try:
-            bpy.ops.object.mode_set(mode="OBJECT")
-        except Exception:
-            pass
-        try:
-            bpy.ops.mesh.customdata_custom_splitnormals_clear()
-        except Exception:
-            pass
+        # 仅在同一目标材质槽内部焊接间距 <=0.15mm 且朝向一致的裂缝顶点
+        by_slot = defaultdict(list)
+        for v in bm.verts:
+            s_set = bm_vert_slots.get(v.index)
+            if s_set and len(s_set) == 1:
+                s = next(iter(s_set))
+                if s in target_slots:
+                    by_slot[s].append(v)
 
-        for p in proxy_mesh.polygons:
-            p.use_smooth = True
-        for e in proxy_mesh.edges:
-            if hasattr(e, "use_edge_sharp"):
-                e.use_edge_sharp = False
+        targetmap = {}
+        for s, v_list in by_slot.items():
+            if len(v_list) < 2:
+                continue
+            kd_weld = kdtree.KDTree(len(v_list))
+            for idx, v in enumerate(v_list):
+                kd_weld.insert(v.co, idx)
+            kd_weld.balance()
 
-        vg = proxy_obj.vertex_groups.new(name="__smooth_mask__")
-        interior_verts = [v for v in group_verts if v not in pinned_verts]
-        if interior_verts:
-            vg.add(interior_verts, 1.0, "REPLACE")
-        if pinned_verts:
-            vg.add(list(pinned_verts), 0.0, "REPLACE")
-
-        mod = proxy_obj.modifiers.new(name="SmoothProxy", type="SMOOTH")
-        mod.factor = 0.5
-        mod.iterations = iterations
-        mod.vertex_group = vg.name
-
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-        eval_obj = proxy_obj.evaluated_get(depsgraph)
-        eval_mesh = bpy.data.meshes.new_from_object(eval_obj)
-
-        try:
-            eval_mesh.update()
-            vert_acc = defaultdict(Vector)
-            for p_idx in poly_indices:
-                poly = eval_mesh.polygons[p_idx]
-                p_no = poly.normal
-                if (
-                    not all(math.isfinite(x) for x in p_no)
-                    or p_no.length_squared < 1e-12
-                ):
+            visited = set()
+            for idx, v in enumerate(v_list):
+                if idx in visited:
                     continue
-                area_n = p_no * max(poly.area, 1e-8)
-                for v_idx in poly.vertices:
-                    vert_acc[v_idx] += area_n
+                n_base = bm_vert_acc[v.index]
+                if n_base.length_squared <= 1e-12:
+                    continue
+                n_base_u = n_base.normalized()
+                hits = kd_weld.find_range(v.co, 0.00015)
+                if len(hits) <= 1:
+                    continue
+                visited.add(idx)
+                for _, other_idx, _ in hits:
+                    if other_idx == idx or other_idx in visited:
+                        continue
+                    ov = v_list[other_idx]
+                    n_other = bm_vert_acc[ov.index]
+                    if (
+                        n_other.length_squared > 1e-12
+                        and n_base_u.dot(n_other.normalized()) > 0.30
+                    ):
+                        targetmap[ov] = v
+                        visited.add(other_idx)
 
-            co_groups = defaultdict(list)
-            for v_idx in group_verts:
-                co = orig_mesh.vertices[v_idx].co
-                co_groups[(round(co.x, 5), round(co.y, 5), round(co.z, 5))].append(
-                    v_idx
-                )
+        if targetmap:
+            welded_cnt = len(targetmap)
+            bmesh.ops.weld_verts(bm, targetmap=targetmap)
 
-            for v_list in co_groups.values():
-                if len(v_list) > 1:
-                    orig_norms = {v: vert_acc[v].copy() for v in v_list}
-                    for v in v_list:
-                        base_n = orig_norms[v]
-                        if base_n.length_squared <= 1e-12:
-                            continue
-                        merged = base_n.copy()
-                        for other_v in v_list:
-                            if other_v == v:
-                                continue
-                            on = orig_norms[other_v]
-                            if (
-                                on.length_squared > 1e-12
-                                and base_n.normalized().dot(on.normalized()) > 0.2
-                            ):
-                                merged += on
-                        vert_acc[v] = merged
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
 
-            result = {}
-            for v_idx in group_verts:
-                n = vert_acc[v_idx]
-                if all(math.isfinite(x) for x in n) and n.length_squared > 1e-12:
-                    result[v_idx] = n.normalized()
+        # 在焊接后的拓扑上重新计算面积加权顶点法线，并建立单环邻接图
+        w_acc = defaultdict(Vector)
+        w_slots = defaultdict(set)
+        w_neighbors = defaultdict(set)
+        for f in bm.faces:
+            if f.material_index not in target_slots:
+                continue
+            f_no = f.normal
+            if not all(math.isfinite(x) for x in f_no) or f_no.length_squared < 1e-12:
+                continue
+            area_n = f_no * max(f.calc_area(), 1e-8)
+            f_verts = [v.index for v in f.verts]
+            for v_idx in f_verts:
+                w_acc[v_idx] += area_n
+                w_slots[v_idx].add(f.material_index)
+            for e in f.edges:
+                va, vb = e.verts[0].index, e.verts[1].index
+                w_neighbors[va].add(vb)
+                w_neighbors[vb].add(va)
+
+        w_norm = {}
+        for v_idx, acc in w_acc.items():
+            if acc.length_squared > 1e-12:
+                w_norm[v_idx] = acc.normalized()
+
+        # 纯法线空间拉普拉斯平滑（受角度保护，不移顶点，彻底抚平改模凹凸法线）
+        for _ in range(smooth_passes):
+            nxt = {}
+            for v_idx, n_cur in w_norm.items():
+                nbs = w_neighbors.get(v_idx)
+                if not nbs:
+                    nxt[v_idx] = n_cur
+                    continue
+                acc_nb = Vector((0.0, 0.0, 0.0))
+                cnt_nb = 0
+                for nb in nbs:
+                    n_nb = w_norm.get(nb)
+                    if n_nb is not None and n_cur.dot(n_nb) >= cos_limit:
+                        acc_nb += n_nb
+                        cnt_nb += 1
+                if cnt_nb > 0 and acc_nb.length_squared > 1e-12:
+                    blended = n_cur * 0.45 + acc_nb.normalized() * 0.55
+                    nxt[v_idx] = (
+                        blended.normalized()
+                        if blended.length_squared > 1e-12
+                        else n_cur
+                    )
                 else:
-                    orig_n = Vector(orig_mesh.vertices[v_idx].normal)
-                    result[v_idx] = (
-                        orig_n.normalized()
-                        if orig_n.length_squared > 1e-12
+                    nxt[v_idx] = n_cur
+            w_norm = nxt
+
+        # 计算原始坐标兜底法线
+        slot_orig_list = defaultdict(list)
+        for v_idx in group_verts:
+            slot_orig_list[vert_slot[v_idx]].append(v_idx)
+
+        clean_fallback = {}
+        for s, v_list in slot_orig_list.items():
+            kd_orig = kdtree.KDTree(len(v_list))
+            for idx, v_idx in enumerate(v_list):
+                kd_orig.insert(orig_mesh.vertices[v_idx].co, idx)
+            kd_orig.balance()
+            for v_idx in v_list:
+                n_base = orig_vert_acc[v_idx]
+                if n_base.length_squared <= 1e-12:
+                    on = Vector(orig_mesh.vertices[v_idx].normal)
+                    clean_fallback[v_idx] = (
+                        on.normalized()
+                        if on.length_squared > 1e-12
                         else Vector((0.0, 0.0, 1.0))
                     )
-            return result
-        finally:
-            bpy.data.meshes.remove(eval_mesh)
+                    continue
+                n_u = n_base.normalized()
+                merged = n_base.copy()
+                for _, o_idx, _ in kd_orig.find_range(
+                    orig_mesh.vertices[v_idx].co, 0.00015
+                ):
+                    ov = v_list[o_idx]
+                    if ov == v_idx:
+                        continue
+                    n_o = orig_vert_acc[ov]
+                    if n_o.length_squared > 1e-12 and n_u.dot(n_o.normalized()) > 0.30:
+                        merged += n_o
+                clean_fallback[v_idx] = (
+                    merged.normalized() if merged.length_squared > 1e-12 else n_u
+                )
+
+        # 用焊接后 bmesh 坐标建 KDTree 映射回 orig_mesh 顶点
+        slot_kd = {}
+        slot_vecs = {}
+        for s in target_slots:
+            p_verts = [
+                v_idx
+                for v_idx, s_set in w_slots.items()
+                if s in s_set and v_idx in w_norm
+            ]
+            if not p_verts:
+                continue
+            kd_p = kdtree.KDTree(len(p_verts))
+            for i_p, v_idx in enumerate(p_verts):
+                kd_p.insert(bm.verts[v_idx].co, i_p)
+            kd_p.balance()
+            slot_kd[s] = kd_p
+            slot_vecs[s] = [(v_idx, w_norm[v_idx]) for v_idx in p_verts]
+
+        result = {}
+        for v_idx in group_verts:
+            fb_n = clean_fallback[v_idx]
+            s = vert_slot[v_idx]
+            kd_p = slot_kd.get(s)
+            if kd_p is None:
+                result[v_idx] = fb_n
+                continue
+            co = orig_mesh.vertices[v_idx].co
+            best_n = None
+            best_dot = -1.0
+            for _, i_p, _ in kd_p.find_range(co, 0.0002):
+                _, pn = slot_vecs[s][i_p]
+                d = fb_n.dot(pn)
+                if d > 0.15 and d > best_dot:
+                    best_dot = d
+                    best_n = pn
+            if best_n is None:
+                _, i_p, _ = kd_p.find(co)
+                _, pn = slot_vecs[s][i_p]
+                best_n = pn if fb_n.dot(pn) > 0.15 else fb_n
+            result[v_idx] = best_n
+
+        return result, clean_fallback, welded_cnt
     finally:
-        bpy.data.objects.remove(proxy_obj, do_unlink=True)
-        bpy.data.meshes.remove(proxy_mesh)
+        bm.free()
 
 
-def apply_face_ellipsoid_blend(orig_obj, face_vert_normals, blend=0.65):
+def apply_face_ellipsoid_blend(orig_obj, face_vert_normals, blend=0.50):
     if not face_vert_normals:
         return face_vert_normals
 
@@ -204,12 +306,15 @@ def apply_face_ellipsoid_blend(orig_obj, face_vert_normals, blend=0.65):
         return face_vert_normals
 
     coords = [mesh.vertices[v].co for v in target_verts]
-    min_co = Vector(
-        (min(c.x for c in coords), min(c.y for c in coords), min(c.z for c in coords))
-    )
-    max_co = Vector(
-        (max(c.x for c in coords), max(c.y for c in coords), max(c.z for c in coords))
-    )
+    xs = sorted(c.x for c in coords)
+    ys = sorted(c.y for c in coords)
+    zs = sorted(c.z for c in coords)
+    n_c = len(coords)
+    i_lo = min(n_c - 1, max(0, int(n_c * 0.03)))
+    i_hi = min(n_c - 1, max(0, int(n_c * 0.97)))
+
+    min_co = Vector((xs[i_lo], ys[i_lo], zs[i_lo]))
+    max_co = Vector((xs[i_hi], ys[i_hi], zs[i_hi]))
     center = (min_co + max_co) * 0.5
     half = (max_co - min_co) * 0.5
 
@@ -231,13 +336,151 @@ def apply_face_ellipsoid_blend(orig_obj, face_vert_normals, blend=0.65):
             height_fade = max(
                 0.0, min(1.0, (mesh.vertices[v_idx].co.z - (head_z - 0.02)) / 0.05)
             )
-        local_w = blend * height_fade * max(0.0, n_proxy.dot(n_sphere))
+        dot_pos = max(0.0, n_proxy.dot(n_sphere))
+        local_w = blend * height_fade * (dot_pos**0.8)
 
         n_final = n_proxy.lerp(n_sphere, local_w)
         if n_final.length_squared > 1e-12:
             out[v_idx] = n_final.normalized()
 
     return out
+
+
+def heal_same_material_seam_normals(mesh, loop_normals, cos_thresh=0.6428):
+    """对同材质内部、间距 <=0.15mm 且几何折角 <50° 的未合并裂口顶点做一次法线平均，保留硬边同时消除改模碎影"""
+    slot_verts = defaultdict(set)
+    slot_loops_by_v = defaultdict(lambda: defaultdict(list))
+    loops = mesh.loops
+
+    for poly in mesh.polygons:
+        s = poly.material_index
+        for l_idx in poly.loop_indices:
+            v_idx = loops[l_idx].vertex_index
+            slot_verts[s].add(v_idx)
+            slot_loops_by_v[s][v_idx].append(l_idx)
+
+    healed_verts = 0
+    for s, v_set in slot_verts.items():
+        if len(v_set) < 2:
+            continue
+        v_list = list(v_set)
+        v_norm = {}
+        for v_idx in v_list:
+            acc = Vector((0.0, 0.0, 0.0))
+            for l_idx in slot_loops_by_v[s][v_idx]:
+                acc += Vector(loop_normals[l_idx])
+            if acc.length_squared > 1e-12:
+                v_norm[v_idx] = acc.normalized()
+
+        kd = kdtree.KDTree(len(v_list))
+        for idx, v_idx in enumerate(v_list):
+            kd.insert(mesh.vertices[v_idx].co, idx)
+        kd.balance()
+
+        for v_idx in v_list:
+            n_base = v_norm.get(v_idx)
+            if n_base is None:
+                continue
+            hits = kd.find_range(mesh.vertices[v_idx].co, 0.00015)
+            if len(hits) <= 1:
+                continue
+            merged = n_base.copy()
+            cnt = 1
+            for _, o_idx, _ in hits:
+                ov = v_list[o_idx]
+                if ov == v_idx:
+                    continue
+                n_o = v_norm.get(ov)
+                if n_o is not None and n_base.dot(n_o) >= cos_thresh:
+                    merged += n_o
+                    cnt += 1
+            if cnt > 1 and merged.length_squared > 1e-12:
+                avg_tup = tuple(merged.normalized())
+                for l_idx in slot_loops_by_v[s][v_idx]:
+                    loop_normals[l_idx] = avg_tup
+                healed_verts += 1
+
+    return healed_verts
+
+
+def inspect_and_fix_mesh_anomalies(mesh, loop_normals):
+    """修复全网格孤立反转循环法线（0<flip<35%）并检测同材质槽内部的重合面与硬平面异常"""
+    loops = mesh.loops
+    slot_polys = defaultdict(list)
+    slot_vert_acc = defaultdict(lambda: defaultdict(Vector))
+
+    for p_idx, poly in enumerate(mesh.polygons):
+        s = poly.material_index
+        slot_polys[s].append(p_idx)
+        p_no = poly.normal
+        if all(math.isfinite(x) for x in p_no) and p_no.length_squared > 1e-12:
+            area_n = p_no * max(poly.area, 1e-8)
+            for v_idx in poly.vertices:
+                slot_vert_acc[s][v_idx] += area_n
+
+    fixed_isolated = 0
+    anomaly_notes = []
+
+    for s, p_indices in sorted(slot_polys.items()):
+        mat_name = (
+            mesh.materials[s].name
+            if 0 <= s < len(mesh.materials) and mesh.materials[s]
+            else f"slot_{s}"
+        )
+        total_loops = 0
+        flipped_list = []
+        flat_faces = 0
+        seen_centers = {}
+        same_slot_dups = 0
+
+        for p_idx in p_indices:
+            poly = mesh.polygons[p_idx]
+            p_no = poly.normal
+            if not poly.use_smooth:
+                flat_faces += 1
+            c = poly.center
+            ckey = (round(c.x, 4), round(c.y, 4), round(c.z, 4))
+            if ckey in seen_centers:
+                same_slot_dups += 1
+            else:
+                seen_centers[ckey] = p_idx
+
+            for l_idx in poly.loop_indices:
+                total_loops += 1
+                ln = Vector(loop_normals[l_idx])
+                if (
+                    not all(math.isfinite(x) for x in ln)
+                    or ln.length_squared < 1e-12
+                    or (p_no.length_squared > 1e-12 and p_no.dot(ln) < 0.0)
+                ):
+                    flipped_list.append((p_idx, l_idx))
+
+        flip_ratio = len(flipped_list) / max(1, total_loops)
+        # 仅修复孤立反转循环法线（跳过 100% 反面的 目 / 裙内）
+        if flipped_list and flip_ratio < 0.35:
+            for p_idx, l_idx in flipped_list:
+                poly = mesh.polygons[p_idx]
+                v_idx = loops[l_idx].vertex_index
+                vn = slot_vert_acc[s].get(v_idx)
+                if (
+                    vn is not None
+                    and vn.length_squared > 1e-12
+                    and poly.normal.dot(vn) > 0.0
+                ):
+                    loop_normals[l_idx] = tuple(vn.normalized())
+                elif poly.normal.length_squared > 1e-12:
+                    loop_normals[l_idx] = tuple(poly.normal.normalized())
+                fixed_isolated += 1
+
+        if same_slot_dups >= 10 or flat_faces >= 10:
+            anomaly_notes.append(
+                f"{mat_name}(同槽重合面={same_slot_dups}, 平面着色={flat_faces}, 孤立反法线={len(flipped_list)})"
+            )
+
+    if fixed_isolated:
+        print(f"   🔧 [{mesh.name}] 已自动修复 {fixed_isolated} 个孤立反转/零法线循环")
+    if anomaly_notes:
+        print(f"   🔎 [{mesh.name}] 改模拓扑体检: {', '.join(anomaly_notes)}")
 
 
 def repair_skin_normals(obj):
@@ -274,14 +517,11 @@ def repair_skin_normals(obj):
         if kind in groups:
             groups[kind].append(p_idx)
 
-    if not any(groups.values()):
-        return
-
     loops = mesh.loops
-    cos_flip_guard = math.cos(math.radians(80.0))
+    cos_flip_guard = math.cos(math.radians(82.0))
+    total_welded = 0
 
-    def _safe_write_group(poly_list, vn_map, min_dot):
-        skipped_flip = 0
+    def _safe_write_group(poly_list, vn_map, fallback_map, min_dot):
         for p_idx in poly_list:
             poly = mesh.polygons[p_idx]
             p_no = poly.normal
@@ -290,7 +530,8 @@ def repair_skin_normals(obj):
             cand = []
             valid = True
             for l_idx in poly.loop_indices:
-                vn = vn_map.get(loops[l_idx].vertex_index)
+                v_idx = loops[l_idx].vertex_index
+                vn = vn_map.get(v_idx)
                 if (
                     vn is None
                     or not all(math.isfinite(x) for x in vn)
@@ -305,22 +546,43 @@ def repair_skin_normals(obj):
                 for l_idx, n_tup in cand:
                     loop_normals[l_idx] = n_tup
             else:
-                skipped_flip += 1
-        return skipped_flip
+                poly.use_smooth = True
+                for l_idx in poly.loop_indices:
+                    v_idx = loops[l_idx].vertex_index
+                    fb = fallback_map.get(v_idx)
+                    if (
+                        fb is not None
+                        and all(math.isfinite(x) for x in fb)
+                        and fb.length_squared > 1e-12
+                        and p_no.dot(fb) > 0.05
+                    ):
+                        loop_normals[l_idx] = tuple(fb.normalized())
 
     if groups["face_skin"]:
-        face_vn = compute_proxy_smooth_normals(obj, groups["face_skin"], iterations=16)
-        face_vn = apply_face_ellipsoid_blend(obj, face_vn, blend=0.65)
-        _safe_write_group(groups["face_skin"], face_vn, cos_flip_guard)
+        face_vn, face_fb, w_cnt = compute_welded_smooth_normals(
+            obj, groups["face_skin"], smooth_passes=4, crease_deg=75.0
+        )
+        total_welded += w_cnt
+        face_vn = apply_face_ellipsoid_blend(obj, face_vn, blend=0.50)
+        _safe_write_group(groups["face_skin"], face_vn, face_fb, cos_flip_guard)
 
     if groups["body_skin"]:
-        skin_vn = compute_proxy_smooth_normals(obj, groups["body_skin"], iterations=8)
-        _safe_write_group(groups["body_skin"], skin_vn, cos_flip_guard)
+        skin_vn, skin_fb, w_cnt = compute_welded_smooth_normals(
+            obj, groups["body_skin"], smooth_passes=4, crease_deg=70.0
+        )
+        total_welded += w_cnt
+        _safe_write_group(groups["body_skin"], skin_vn, skin_fb, cos_flip_guard)
 
     if groups["body_mixed"]:
-        mixed_vn = compute_proxy_smooth_normals(obj, groups["body_mixed"], iterations=5)
+        mixed_vn, mixed_fb, w_cnt = compute_welded_smooth_normals(
+            obj, groups["body_mixed"], smooth_passes=2, crease_deg=52.0
+        )
+        total_welded += w_cnt
         cos_crease = math.cos(math.radians(55.0))
-        _safe_write_group(groups["body_mixed"], mixed_vn, cos_crease)
+        _safe_write_group(groups["body_mixed"], mixed_vn, mixed_fb, cos_crease)
+
+    healed_cnt = heal_same_material_seam_normals(mesh, loop_normals)
+    inspect_and_fix_mesh_anomalies(mesh, loop_normals)
 
     if hasattr(mesh, "use_auto_smooth"):
         mesh.use_auto_smooth = True
@@ -328,7 +590,8 @@ def repair_skin_normals(obj):
     mesh.update()
     print(
         f"   ✨ [{obj.name}] 法线重构完成: "
-        f"脸部={len(groups['face_skin'])}面, 纯皮肤={len(groups['body_skin'])}面, 身体混合={len(groups['body_mixed'])}面"
+        f"脸部={len(groups['face_skin'])}面, 纯皮肤={len(groups['body_skin'])}面, "
+        f"身体混合={len(groups['body_mixed'])}面 | 焊接代理裂缝={total_welded}点, 抚平同材质裂口={healed_cnt}点"
     )
 
 

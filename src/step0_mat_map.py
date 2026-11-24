@@ -94,7 +94,7 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
     i = _clean_blender_suffix(img_name)
     s = f"{m} {i}"
 
-    # 1. 眼部高光 / 眼影 / 腮红(含照れ) / 表情贴片 / 玻璃 / 镜片 / 特效（BLEND + 黑底自动扣透明）
+    # 1. 眼部高光 / 眼影 / 腮红(含照れ) / 表情贴片 / 玻璃 / 镜片 / 特效
     if (
         any(
             kw in m
@@ -260,11 +260,15 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
     ):
         return "cutout_cloth"
 
-    # 6. 脸部 / 鼻子
-    if any(
-        kw in m
-        for kw in ("face", "kao", "nose", "颜", "顔", "脸", "面部", "鼻", "lian")
-    ) or ("face" in i and "emo" not in i and "cheek" not in i):
+    # 6. 脸部 / 鼻子（排除 颜饰/面饰，避免拉偏脸部法线椭球）
+    is_face_accessory = any(kw in m for kw in ("颜饰", "顔飾", "面饰"))
+    if not is_face_accessory and (
+        any(
+            kw in m
+            for kw in ("face", "kao", "nose", "颜", "顔", "脸", "面部", "鼻", "lian")
+        )
+        or ("face" in i and "emo" not in i and "cheek" not in i)
+    ):
         return "face"
 
     # 7. 身体纯皮肤
@@ -294,12 +298,14 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
     ):
         return "skin"
 
-    # 8. 头发 / 刘海（排除发饰/发卡/发带等配件）
+    # 8. 头发 / 刘海（同时兼容 髪 / 髮 / 发，排除发饰/发卡/发带等配件）
     is_hair_accessory = any(
         kw in m
         for kw in (
             "发饰",
             "髪飾",
+            "髮饰",
+            "髮飾",
             "发卡",
             "发夹",
             "发带",
@@ -308,8 +314,6 @@ def classify_material_role(mat_name: str, img_name: str = "") -> str:
             "发冠",
             "发箍",
             "发结",
-            "髮饰",
-            "髮飾",
         )
     )
     if not is_hair_accessory and any(
@@ -373,7 +377,6 @@ def classify_surface_for_normals(
         return "face_skin"
 
     if role == "skin":
-        # 手部/手指/指甲几何体极细，严禁进 SMOOTH 代理平滑，否则手指会被压瘪导致法线翻转变黑
         if (
             m.startswith("手")
             or "hand" in m
