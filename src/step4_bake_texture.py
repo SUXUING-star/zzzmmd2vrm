@@ -244,10 +244,8 @@ def is_plus_overlay_material(mat_name: str, img_name: str = "") -> bool:
     i = re.sub(r"\.\d{3}$", "", (img_name or "").strip().lower())
     if "+" in m or "+" in i:
         return True
-    if re.match(r"^(?:手|肌|体|发|髮|衣|鞋|袜|饰|金属)\d+$", m):
-        return True
-    if re.search(r"(?:^|_)(?:s\d*|sp\d*|dp|w|p|t)$", m) or re.search(
-        r"(?:^|_)(?:s\d*|sp\d*|dp)$", os.path.splitext(i)[0]
+    if re.search(r"_(?:s\d*|sp\d*|dp|w|p|t)$", m) or re.search(
+        r"_(?:s\d*|sp\d*|dp)$", os.path.splitext(i)[0]
     ):
         return True
     return False
@@ -296,7 +294,7 @@ def alpha_bleed_rgba(arr, passes=5):
 
 
 def maybe_synthesize_black_bg_alpha(arr, role, is_plus=False):
-    """对 fx_overlay 及 +/_w/_s/_sp 叠层：只要不透明区内存在 >5% 的死黑背景（如 体s.png 腰/袖子黑底），将死黑像素抠成透明"""
+    """仅当贴图确实以大面积纯黑为背景（+叠层纯黑>=45%，fx_overlay>=25%）时才抠黑底，避免误伤只有阴影黑色的普通漫反射贴图"""
     if role != "fx_overlay" and not is_plus:
         return arr
     alpha = arr[:, :, 3]
@@ -307,9 +305,9 @@ def maybe_synthesize_black_bg_alpha(arr, role, is_plus=False):
     luma = np.max(arr[:, :, :3], axis=2)
     opaque_luma = luma[opaque_mask]
     opaque_black_ratio = float(np.mean(opaque_luma < 22.0))
+    thresh = 0.25 if role == "fx_overlay" else 0.45
 
-    if opaque_black_ratio > 0.05 and float(np.max(opaque_luma)) > 55.0:
-        # luma <= 15 的纯黑像素 alpha 归零；15~55 平滑过渡；>= 55 的白边/肤色/星星 100% 保持原 alpha
+    if opaque_black_ratio >= thresh and float(np.max(opaque_luma)) > 55.0:
         luma_alpha = np.clip((luma - 15.0) * (255.0 / 40.0), 0.0, 255.0)
         arr = arr.copy()
         dark_zone = luma < 55.0
@@ -319,13 +317,15 @@ def maybe_synthesize_black_bg_alpha(arr, role, is_plus=False):
 
 def detect_alpha_mode(rgba_arr, role, mat_or_img_name, is_plus=False):
     name_low = mat_or_img_name.lower()
-    if role == "fx_overlay":
-        return True, "BLEND"
-
     alpha = rgba_arr[:, :, 3]
     transparent_ratio = float(np.mean(alpha < 20.0))
     non_opaque = alpha < 250
     has_non_opaque = bool(np.any(non_opaque))
+
+    if role == "fx_overlay":
+        if has_non_opaque or transparent_ratio >= 0.01:
+            return True, "BLEND"
+        return False, "OPAQUE"
 
     if transparent_ratio >= 0.45 or (is_plus and transparent_ratio >= 0.05):
         semi = (alpha > 10) & (alpha < 245)

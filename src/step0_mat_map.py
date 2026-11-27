@@ -34,6 +34,21 @@ def _is_toon_or_sphere_image(img) -> bool:
     return False
 
 
+def _find_upstream_tex_image(node, depth=0):
+    if not node or depth > 3:
+        return None
+    if node.type == "TEX_IMAGE" and node.image:
+        if not _is_toon_or_sphere_image(node.image):
+            return node.image
+        return None
+    for inp in getattr(node, "inputs", ()):
+        if inp.is_linked:
+            res = _find_upstream_tex_image(inp.links[0].from_node, depth + 1)
+            if res:
+                return res
+    return None
+
+
 def extract_material_base_image(mat):
     """准确提取 mmd_tools 或 Principled BSDF 中的 Base 贴图（避开 ZZZ/原神 的 spa/toon .bmp）"""
     if not mat or not mat.use_nodes or not mat.node_tree:
@@ -49,26 +64,17 @@ def extract_material_base_image(mat):
     if mmd_shader and "Base Tex" in mmd_shader.inputs:
         inp = mmd_shader.inputs["Base Tex"]
         if inp.is_linked:
-            src = inp.links[0].from_node
-            if (
-                src.type == "TEX_IMAGE"
-                and src.image
-                and not _is_toon_or_sphere_image(src.image)
-            ):
-                return src.image
-        return None
+            img = _find_upstream_tex_image(inp.links[0].from_node)
+            if img:
+                return img
 
     for node in nodes:
         if node.type == "BSDF_PRINCIPLED":
             inp = node.inputs.get("Base Color")
             if inp and inp.is_linked:
-                src = inp.links[0].from_node
-                if (
-                    src.type == "TEX_IMAGE"
-                    and src.image
-                    and not _is_toon_or_sphere_image(src.image)
-                ):
-                    return src.image
+                img = _find_upstream_tex_image(inp.links[0].from_node)
+                if img:
+                    return img
 
     for node in nodes:
         if node.type == "TEX_IMAGE" and node.image:

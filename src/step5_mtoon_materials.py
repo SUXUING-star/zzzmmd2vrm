@@ -20,7 +20,6 @@ def load_baked_img(texture_dirs, filename, colorspace="sRGB"):
             os.path.join(td, filename),
         ):
             if os.path.exists(fpath):
-                # 若 Blender 内存里已有同名旧打包图，先移除再从磁盘加载最新烘焙结果
                 old_img = bpy.data.images.get(os.path.basename(fpath))
                 if old_img is not None:
                     try:
@@ -210,7 +209,27 @@ def run(texture_dir):
         manifest_key = f"{orig_img_name}::{alpha_policy}" if orig_img_name else ""
         info = manifest.get(manifest_key) or manifest.get(orig_img_name, {})
         is_dead_spa = bool(info.get("is_dead_spa_overlay", False))
-        eff_alpha = 0.0 if is_dead_spa else mat_alpha
+
+        # 动态识别仅用于 MMD .spa 提亮的叠加层（如 髮+ 无 Base 贴图或复用 0% 透明底图，或漫反射为纯黑）
+        is_no_base_plus_spa = alpha_policy == "plus" and orig_img is None
+        is_untextured_plus_spa = (
+            alpha_policy == "plus"
+            and orig_img is not None
+            and not info.get("has_alpha", False)
+            and mat_alpha >= 0.99
+        )
+        is_black_diffuse_plus = (
+            alpha_policy == "plus"
+            and max(diffuse_rgb) <= 0.05
+            and max(ambient_rgb) <= 0.05
+        )
+        hide_overlay = (
+            is_dead_spa
+            or is_no_base_plus_spa
+            or is_untextured_plus_spa
+            or is_black_diffuse_plus
+        )
+        eff_alpha = 0.0 if hide_overlay else mat_alpha
 
         lit_fname = info.get("lit")
         if lit_fname:
@@ -264,7 +283,7 @@ def run(texture_dir):
             ur, ug, ub = resolve_untextured_color(diffuse_rgb, ambient_rgb, role)
             gltf.pbr_metallic_roughness.base_color_factor = (ur, ug, ub, eff_alpha)
 
-        if emissive_img and not is_dead_spa:
+        if emissive_img and not hide_overlay:
             gltf.emissive_texture.index.source = emissive_img
             gltf.emissive_factor = (1.0, 1.0, 1.0)
         else:
@@ -272,10 +291,10 @@ def run(texture_dir):
 
         suggested_alpha = info.get("alpha_mode", "OPAQUE")
         if (
-            is_dead_spa
+            hide_overlay
             or eff_alpha < 0.99
-            or role == "fx_overlay"
             or suggested_alpha == "BLEND"
+            or (role == "fx_overlay" and info.get("has_alpha"))
         ):
             gltf.alpha_mode = "BLEND"
         elif suggested_alpha == "MASK" or (
@@ -291,7 +310,16 @@ def run(texture_dir):
                 mat.surface_render_method = "DITHERED"
 
         mtoon = gltf.extensions.vrmc_materials_mtoon
-        mtoon.transparent_with_z_write = False
+        # 紧贴表面的贴片(fx_overlay / plus)关闭深度写入；实心半透 3D 部件(如水晶鞋跟)开启深度写入防止透视消失
+        if gltf.alpha_mode == "BLEND":
+            mtoon.transparent_with_z_write = (
+                not hide_overlay
+                and role != "fx_overlay"
+                and alpha_policy != "plus"
+                and eff_alpha > 0.01
+            )
+        else:
+            mtoon.transparent_with_z_write = False
         mtoon.render_queue_offset_number = 1 if gltf.alpha_mode == "BLEND" else 0
 
         tint = get_shade_tint_tuple(shading_role)
@@ -326,6 +354,18 @@ def run(texture_dir):
         mtoon.outline_width_mode = "none"
         if mat.node_tree:
             mat.node_tree.update_tag()
+
+        if (
+            gltf.alpha_mode != "OPAQUE"
+            or hide_overlay
+            or "+" in mat.name
+            or any(k in mat.name for k in ("体", "鞋", "脚", "髮", "发"))
+        ):
+            print(
+                f"   🎨 [材质诊断] {mat.name} | img={orig_img_name or 'None'} | role={role}, policy={alpha_policy} | "
+                f"alpha_mode={gltf.alpha_mode}, eff_alpha={eff_alpha:.2f}, "
+                f"z_write={mtoon.transparent_with_z_write}, hide={hide_overlay}"
+            )
 
         if any(k in mat.name for k in ("手", "肌", "衣金属+", "鞋+")):
             uv_diag_targets.add(mat.name)
